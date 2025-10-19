@@ -1,4 +1,0 @@
-python-telegram-bot
-azure-ai
-requests
-azure-functions
