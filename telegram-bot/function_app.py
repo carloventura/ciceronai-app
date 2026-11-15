@@ -11,34 +11,56 @@ app = func.FunctionApp()
 
 @app.route(route="ChatMessage", auth_level=func.AuthLevel.ANONYMOUS, methods=[func.HttpMethod.POST])
 async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
-    async with Bot(os.environ['TELEGRAM_TOKEN']) as bot:
+    logging.info('Python HTTP trigger function processed a request.')
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Error", status_code=400)
 
-        logging.info('Python HTTP trigger function processed a request.')
-        client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version=os.getenv("AZURE_API_VERSION"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        )
-        
-        try:
-            body = req.get_json()
-        except ValueError:
-            return func.HttpResponse(
-                "Error",
-                status_code=400
-            )
+    async with Bot(os.environ['TELEGRAM_TOKEN']) as bot:
+        if "callback_query" in body:
+            callback_query = body["callback_query"]
+            await bot.answer_callback_query(callback_query["id"])
+            chat_id = callback_query["message"]["chat"]["id"]
+            callback_data = callback_query.get("data")
+
+            if callback_data == "new_session":
+                await bot.send_message(
+                    chat_id,
+                    "La creazione di una nuova sessione non è ancora disponibile.",
+                )
+            elif callback_data == "enter_session_code":
+                await bot.send_message(
+                    chat_id,
+                    "L'inserimento e la verifica del codice di sessione non sono ancora disponibili.",
+                )
+
+            return func.HttpResponse("OK", status_code=200)
+
+        if "message" not in body or "chat" not in body["message"]:
+            return func.HttpResponse("Unsupported update", status_code=400)
+
         logging.info(body)
         chat_id = body['message']['chat']['id']
-        
+
         if "text" in body["message"] and body["message"]["text"] == "/start":
             inline_keyboard =  InlineKeyboardMarkup([
-                [InlineKeyboardButton("Riconoscimento Luogo", callback_data="riconoscimento_luogo")],
-                [InlineKeyboardButton("Guida Multimediale", callback_data="guida_multimediale")],
+                [InlineKeyboardButton("Avvia nuova sessione", callback_data="new_session")],
+                [InlineKeyboardButton("Ho un codice di sessione", callback_data="enter_session_code")],
             ])
-            await bot.send_message(chat_id, "Scegli:", reply_markup=inline_keyboard)
+            await bot.send_message(
+                chat_id,
+                "Vuoi avviare una nuova sessione o hai già un codice di sessione?",
+                reply_markup=inline_keyboard,
+            )
             return func.HttpResponse("OK", status_code=200)
 
         if "photo" in body["message"]:
+            client = AzureOpenAI(
+                api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                api_version=os.getenv("AZURE_API_VERSION"),
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            )
             file_id = body["message"]["photo"][0]["file_id"]
             photo_file = await bot.get_file(file_id)
             byte_array = await photo_file.download_as_bytearray()
