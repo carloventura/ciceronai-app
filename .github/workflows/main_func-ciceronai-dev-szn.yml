@@ -37,7 +37,10 @@ jobs:
       - name: Install dependencies
         run: pip install --target=".python_packages/lib/site-packages" -r requirements.txt
 
-      # Optional: Add step to run tests here
+      - name: Validate function imports
+        run: python -c "import function_app"
+        env:
+          PYTHONPATH: .python_packages/lib/site-packages
 
       - name: Zip artifact for deployment
         run: zip -r ../release.zip .
@@ -67,7 +70,7 @@ jobs:
         run: |
           unzip release.zip -d ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
           rm release.zip
-        
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
