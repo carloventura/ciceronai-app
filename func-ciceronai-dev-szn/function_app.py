@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -8,15 +9,43 @@ import azure.functions as func
 from azure.core.credentials import AzureNamedKeyCredential
 from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableClient, TableServiceClient
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
 
 from fantasy_names import ADJECTIVES, NOUNS
 
 app = func.FunctionApp()
 
+NEW_CHARACTER_PROMPT = "Descrivi il tuo personaggio nel formato nome | descrizione."
+SESSION_CODE_PROMPT = "Scrivi il nome della sessione da recuperare."
+JOIN_CHARACTER_PROMPT_PREFIX = "Descrivi il personaggio per la sessione "
+JOIN_CHARACTER_PROMPT_SUFFIX = " nel formato nome | descrizione."
+
 
 def generate_session_name() -> str:
     return f"{random.choice(ADJECTIVES)}-{random.choice(NOUNS)}"
+
+
+def parse_character(text: str) -> dict | None:
+    parts = text.split("|", 1)
+    if len(parts) != 2:
+        return None
+
+    name, description = (part.strip() for part in parts)
+    if not name or not description:
+        return None
+
+    return {"name": name, "desc": description, "stats": {}}
+
+
+def is_valid_session_code(session_code: str) -> bool:
+    return bool(session_code) and (
+        session_code[0].isalnum()
+        and session_code[-1].isalnum()
+        and all(
+            character.isascii() and (character.isalnum() or character == "-")
+            for character in session_code
+        )
+    )
 
 
 def get_retention_days() -> int:
@@ -54,12 +83,28 @@ def get_session_by_name(session_name: str) -> dict | None:
         return None
 
 
-def save_session(chat_id: int, status: str, session_name: str | None = None) -> str:
+def save_session(
+    chat_id: int,
+    status: str,
+    session_name: str | None = None,
+    character: dict | None = None,
+) -> str:
     table_client = get_table_client()
     if not session_name:
         session_name = generate_session_name()
         while get_session_by_name(session_name) is not None:
             session_name = generate_session_name()
+
+    existing_session = get_session_by_name(session_name)
+    try:
+        characters = json.loads(existing_session.get("characters", "[]")) if existing_session else []
+    except (TypeError, json.JSONDecodeError):
+        logging.warning("Session %s has invalid characters data; resetting it.", session_name)
+        characters = []
+    if not isinstance(characters, list):
+        characters = []
+    if character:
+        characters.append(character)
 
     now = datetime.now(timezone.utc).isoformat()
     table_client.upsert_entity({
@@ -69,7 +114,8 @@ def save_session(chat_id: int, status: str, session_name: str | None = None) -> 
         "sessionCode": session_name,
         "displayName": session_name,
         "status": status,
-        "createdAt": now,
+        "characters": json.dumps(characters, ensure_ascii=False),
+        "createdAt": existing_session.get("createdAt", now) if existing_session else now,
         "lastUpdated": now,
     })
     return session_name
@@ -122,15 +168,16 @@ async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
             callback_data = callback_query.get("data")
 
             if callback_data == "new_session":
-                session_name = save_session(chat_id, "active")
                 await bot.send_message(
                     chat_id,
-                    f"Benvenuto! La tua sessione è pronta.\n\nNome della chat: {session_name}\nCodice sessione: {session_name}\n\nUsa questo nome per recuperarla.",
+                    NEW_CHARACTER_PROMPT,
+                    reply_markup=ForceReply(selective=True),
                 )
             elif callback_data == "enter_session_code":
                 await bot.send_message(
                     chat_id,
-                    "Scrivi il nome della tua sessione per recuperarla.",
+                    SESSION_CODE_PROMPT,
+                    reply_markup=ForceReply(selective=True),
                 )
 
             return func.HttpResponse("OK", status_code=200)
@@ -156,30 +203,75 @@ async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
 
         if text:
             session_code = text.lower()
-            valid_code = (
-                session_code[0].isalnum()
-                and session_code[-1].isalnum()
-                and all(
-                    character.isascii() and (character.isalnum() or character == "-")
-                    for character in session_code
-                )
-            )
-            session = get_session_by_name(session_code) if valid_code else None
-            if session:
-                now = datetime.now(timezone.utc).isoformat()
-                get_table_client().upsert_entity({
-                    "PartitionKey": session["PartitionKey"],
-                    "RowKey": session["RowKey"],
-                    "chatId": str(chat_id),
-                    "sessionCode": session["sessionCode"],
-                    "displayName": session["displayName"],
-                    "status": "active",
-                    "createdAt": session.get("createdAt", now),
-                    "lastUpdated": now,
-                })
+            reply_to_message = message.get("reply_to_message", {})
+            prompt_text = reply_to_message.get("text", "")
+
+            if prompt_text == NEW_CHARACTER_PROMPT:
+                character = parse_character(text)
+                if character is None:
+                    await bot.send_message(
+                        chat_id,
+                        NEW_CHARACTER_PROMPT,
+                        reply_markup=ForceReply(selective=True),
+                    )
+                    return func.HttpResponse("OK", status_code=200)
+
+                session_name = save_session(chat_id, "active", character=character)
                 await bot.send_message(
                     chat_id,
-                    f"Sessione recuperata: {session['displayName']}",
+                    f"Benvenuto! La tua sessione è pronta.\n\nNome della chat: {session_name}\nCodice sessione: {session_name}\n\nUsa questo nome per recuperarla.",
+                )
+                return func.HttpResponse("OK", status_code=200)
+
+            if prompt_text == SESSION_CODE_PROMPT:
+                session = get_session_by_name(session_code) if is_valid_session_code(session_code) else None
+                if not session:
+                    await bot.send_message(
+                        chat_id,
+                        "Non ho trovato una sessione con questo nome. Inizia con /start per crearne una.",
+                    )
+                    return func.HttpResponse("OK", status_code=200)
+
+                await bot.send_message(
+                    chat_id,
+                    f"{JOIN_CHARACTER_PROMPT_PREFIX}{session_code}{JOIN_CHARACTER_PROMPT_SUFFIX}",
+                    reply_markup=ForceReply(selective=True),
+                )
+                return func.HttpResponse("OK", status_code=200)
+
+            if (
+                prompt_text.startswith(JOIN_CHARACTER_PROMPT_PREFIX)
+                and prompt_text.endswith(JOIN_CHARACTER_PROMPT_SUFFIX)
+            ):
+                session_code = prompt_text[
+                    len(JOIN_CHARACTER_PROMPT_PREFIX):-len(JOIN_CHARACTER_PROMPT_SUFFIX)
+                ]
+                session = get_session_by_name(session_code) if is_valid_session_code(session_code) else None
+                character = parse_character(text)
+                if not session:
+                    await bot.send_message(
+                        chat_id,
+                        "Non ho trovato una sessione con questo nome. Inizia con /start per crearne una.",
+                    )
+                elif character is None:
+                    await bot.send_message(
+                        chat_id,
+                        prompt_text,
+                        reply_markup=ForceReply(selective=True),
+                    )
+                else:
+                    save_session(chat_id, "active", session_name=session_code, character=character)
+                    await bot.send_message(
+                        chat_id,
+                        f"Sessione recuperata: {session['displayName']}",
+                    )
+                return func.HttpResponse("OK", status_code=200)
+
+            session = get_session_by_name(session_code) if is_valid_session_code(session_code) else None
+            if session:
+                await bot.send_message(
+                    chat_id,
+                    "Per unirti, inizia con /start e scegli Ho un codice di sessione.",
                 )
             else:
                 await bot.send_message(
