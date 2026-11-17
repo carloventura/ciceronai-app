@@ -28,6 +28,10 @@ JOIN_CHARACTER_PROMPT_SUFFIX = " nel formato nome | descrizione."
 START_SESSION_CALLBACK_PREFIX = "start_session:"
 TELEGRAM_UPDATES_QUEUE = os.getenv("TELEGRAM_UPDATES_QUEUE", "telegram-updates")
 PROCESSED_UPDATES_PARTITION = "telegram"
+ACCESS_PARTITION_KEY = "access"
+BOT_CONFIG_PARTITION_KEY = "bot-config"
+BOT_CONFIG_ROW_KEY = "settings"
+ADMIN_CALLBACK_PREFIX = "admin:"
 MAX_RECENT_MESSAGES = 6
 MAX_TABLE_PROPERTY_BYTES = 60 * 1024
 MAX_PLAYER_MESSAGE_CHARS = 4000
@@ -206,6 +210,136 @@ def get_processed_update(update_id: int) -> dict | None:
         )
     except ResourceNotFoundError:
         return None
+
+
+def get_admin_user_id() -> int | None:
+    value = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+    try:
+        return int(value) if value else None
+    except ValueError:
+        logging.error("TELEGRAM_ADMIN_ID must be a numeric Telegram user ID.")
+        return None
+
+
+def is_admin_user(user_id: int | None) -> bool:
+    admin_user_id = get_admin_user_id()
+    return admin_user_id is not None and user_id == admin_user_id
+
+
+def get_user_access(user_id: int) -> dict | None:
+    try:
+        return get_table_client("ProcessedUpdates").get_entity(
+            partition_key=ACCESS_PARTITION_KEY,
+            row_key=str(user_id),
+        )
+    except ResourceNotFoundError:
+        return None
+
+
+def ensure_pending_user(user: dict, chat_id: int) -> tuple[dict, bool]:
+    user_id = int(user["id"])
+    table_client = get_table_client("ProcessedUpdates")
+    existing = get_user_access(user_id)
+    if existing is not None:
+        return existing, False
+
+    now = datetime.now(timezone.utc).isoformat()
+    display_name = " ".join(
+        part for part in (user.get("first_name"), user.get("last_name")) if part
+    ) or user.get("username") or str(user_id)
+    entity = {
+        "PartitionKey": ACCESS_PARTITION_KEY,
+        "RowKey": str(user_id),
+        "telegramUserId": user_id,
+        "telegramChatId": str(chat_id),
+        "username": str(user.get("username", "")),
+        "displayName": display_name,
+        "status": "pending",
+        "adminNotified": False,
+        "createdAt": now,
+        "lastUpdated": now,
+    }
+    try:
+        table_client.create_entity(entity)
+        return entity, True
+    except ResourceExistsError:
+        return get_user_access(user_id), False
+
+
+def set_user_access_status(user_id: int, status: str) -> dict:
+    if status not in {"pending", "approved", "rejected", "removed"}:
+        raise ValueError("Invalid user access status.")
+    now = datetime.now(timezone.utc).isoformat()
+    table_client = get_table_client("ProcessedUpdates")
+    existing = get_user_access(user_id)
+    if existing is None:
+        table_client.create_entity({
+            "PartitionKey": ACCESS_PARTITION_KEY,
+            "RowKey": str(user_id),
+            "telegramUserId": user_id,
+            "status": status,
+            "createdAt": now,
+            "lastUpdated": now,
+        })
+        return get_user_access(user_id)
+
+    table_client.upsert_entity(
+        {
+            "PartitionKey": ACCESS_PARTITION_KEY,
+            "RowKey": str(user_id),
+            "status": status,
+            "adminNotified": existing.get("adminNotified", False),
+            "lastUpdated": now,
+        },
+        mode=UpdateMode.MERGE,
+    )
+    return get_user_access(user_id)
+
+
+def mark_admin_notified(user_id: int) -> None:
+    get_table_client("ProcessedUpdates").upsert_entity(
+        {
+            "PartitionKey": ACCESS_PARTITION_KEY,
+            "RowKey": str(user_id),
+            "adminNotified": True,
+            "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        },
+        mode=UpdateMode.MERGE,
+    )
+
+
+def list_users_by_access_status(statuses: set[str] | None = None) -> list[dict]:
+    entities = get_table_client("ProcessedUpdates").list_entities(
+        filter=f"PartitionKey eq '{ACCESS_PARTITION_KEY}'"
+    )
+    users = [
+        entity for entity in entities
+        if statuses is None or entity.get("status") in statuses
+    ]
+    return sorted(users, key=lambda entity: str(entity.get("lastUpdated", "")), reverse=True)
+
+
+def is_game_paused() -> bool:
+    try:
+        settings = get_table_client("ProcessedUpdates").get_entity(
+            partition_key=BOT_CONFIG_PARTITION_KEY,
+            row_key=BOT_CONFIG_ROW_KEY,
+        )
+    except ResourceNotFoundError:
+        return False
+    return bool(settings.get("paused", False))
+
+
+def set_game_paused(paused: bool) -> None:
+    get_table_client("ProcessedUpdates").upsert_entity(
+        {
+            "PartitionKey": BOT_CONFIG_PARTITION_KEY,
+            "RowKey": BOT_CONFIG_ROW_KEY,
+            "paused": paused,
+            "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        },
+        mode=UpdateMode.MERGE,
+    )
 
 
 def begin_update_processing(update_id: int) -> int | None:
@@ -388,6 +522,201 @@ async def send_telegram_message_once(
     return await bot.send_message(chat_id, text, **kwargs)
 
 
+def admin_main_keyboard(paused: bool) -> InlineKeyboardMarkup:
+    pause_label = "▶️ Riprendi gioco" if paused else "⏸ Pausa per non-admin"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Richieste in attesa", callback_data="admin:pending")],
+        [InlineKeyboardButton("Gestisci utenti", callback_data="admin:users")],
+        [InlineKeyboardButton(pause_label, callback_data="admin:toggle-pause")],
+    ])
+
+
+def access_user_keyboard(user_id: int, status: str) -> InlineKeyboardMarkup:
+    if status == "pending":
+        buttons = [
+            InlineKeyboardButton("Approva", callback_data=f"admin:approve:{user_id}"),
+            InlineKeyboardButton("Rifiuta", callback_data=f"admin:reject:{user_id}"),
+        ]
+    elif status == "approved":
+        buttons = [InlineKeyboardButton("Rimuovi accesso", callback_data=f"admin:remove:{user_id}")]
+    else:
+        buttons = [InlineKeyboardButton("Riabilita", callback_data=f"admin:approve:{user_id}")]
+    return InlineKeyboardMarkup([buttons])
+
+
+async def send_admin_menu(bot: Bot, update_id: int, chat_id: int) -> None:
+    paused = is_game_paused()
+    await send_telegram_message_once(
+        bot,
+        update_id,
+        "admin_menu",
+        chat_id,
+        "Pannello amministratore.\n\n"
+        f"Stato gioco per gli utenti: {'in pausa' if paused else 'attivo'}.",
+        reply_markup=admin_main_keyboard(paused),
+    )
+
+
+async def send_admin_pending_users(bot: Bot, update_id: int, chat_id: int) -> None:
+    pending = list_users_by_access_status({"pending"})[:10]
+    if not pending:
+        await send_telegram_message_once(
+            bot, update_id, "admin_no_pending", chat_id, "Non ci sono richieste in attesa."
+        )
+        return
+
+    for user in pending:
+        user_id = int(user["telegramUserId"])
+        username = f"@{user['username']}" if user.get("username") else "(senza username)"
+        await send_telegram_message_once(
+            bot,
+            update_id,
+            f"admin_pending:{user_id}",
+            chat_id,
+            f"Richiesta di accesso\n{user.get('displayName', user_id)}\n{username}\nID: {user_id}",
+            reply_markup=access_user_keyboard(user_id, "pending"),
+        )
+
+
+async def send_admin_users(bot: Bot, update_id: int, chat_id: int) -> None:
+    users = list_users_by_access_status({"approved", "rejected", "removed"})[:10]
+    if not users:
+        await send_telegram_message_once(
+            bot, update_id, "admin_no_users", chat_id, "Non ci sono utenti da gestire."
+        )
+        return
+
+    for user in users:
+        user_id = int(user["telegramUserId"])
+        status = user.get("status", "removed")
+        username = f"@{user['username']}" if user.get("username") else "(senza username)"
+        await send_telegram_message_once(
+            bot,
+            update_id,
+            f"admin_user:{user_id}",
+            chat_id,
+            f"{user.get('displayName', user_id)} {username}\nID: {user_id}\nStato: {status}",
+            reply_markup=access_user_keyboard(user_id, status),
+        )
+
+
+async def handle_admin_callback(bot: Bot, update_id: int, chat_id: int, callback_data: str) -> None:
+    if not callback_data.startswith(ADMIN_CALLBACK_PREFIX):
+        return
+    parts = callback_data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "menu":
+        await send_admin_menu(bot, update_id, chat_id)
+    elif action == "pending":
+        await send_admin_pending_users(bot, update_id, chat_id)
+    elif action == "users":
+        await send_admin_users(bot, update_id, chat_id)
+    elif action == "toggle-pause":
+        paused = not is_game_paused()
+        set_game_paused(paused)
+        await send_admin_menu(bot, update_id, chat_id)
+    elif action in {"approve", "reject", "remove"} and len(parts) == 3 and parts[2].isdigit():
+        user_id = int(parts[2])
+        statuses = {"approve": "approved", "reject": "rejected", "remove": "removed"}
+        status = statuses[action]
+        user = get_user_access(user_id)
+        if user is None:
+            await send_telegram_message_once(
+                bot, update_id, f"admin_missing_user:{user_id}", chat_id,
+                "L'utente non è più presente nell'elenco.",
+            )
+            return
+        set_user_access_status(user_id, status)
+        message = {
+            "approved": "La tua richiesta è stata approvata. Invia /start per entrare nel bot.",
+            "rejected": "La tua richiesta di accesso è stata rifiutata.",
+            "removed": "Il tuo accesso al bot è stato revocato.",
+        }[status]
+        await send_telegram_message_once(
+            bot,
+            update_id,
+            f"access_status:{user_id}",
+            int(user.get("telegramChatId", user_id)),
+            message,
+        )
+        await send_telegram_message_once(
+            bot, update_id, f"admin_status:{user_id}", chat_id,
+            f"Stato aggiornato per {user.get('displayName', user_id)}: {status}.",
+        )
+
+
+async def enforce_user_access(
+    bot: Bot,
+    update_id: int,
+    user: dict,
+    chat_id: int,
+    is_start_command: bool,
+) -> bool:
+    user_id = user.get("id")
+    if user_id is None:
+        return False
+    if is_admin_user(int(user_id)):
+        return True
+
+    access = get_user_access(int(user_id))
+    created = False
+    if access is None:
+        access, created = ensure_pending_user(user, chat_id)
+
+    status = access.get("status", "pending")
+    if status == "approved":
+        if is_game_paused():
+            if is_start_command or created:
+                await send_telegram_message_once(
+                    bot, update_id, "game_paused", chat_id,
+                    "Il bot è temporaneamente in pausa per gli utenti. Riprova più tardi.",
+                )
+            return False
+        return True
+
+    if status == "pending":
+        admin_id = get_admin_user_id()
+        if admin_id is None:
+            logging.error("TELEGRAM_ADMIN_ID is not configured; cannot review access request.")
+            if is_start_command or created:
+                await send_telegram_message_once(
+                    bot, update_id, "admin_not_configured", chat_id,
+                    "Le richieste di accesso non sono disponibili al momento.",
+                )
+            return False
+
+        if not access.get("adminNotified"):
+            display_name = " ".join(
+                part for part in (user.get("first_name"), user.get("last_name")) if part
+            ) or user.get("username") or str(user_id)
+            username = f"@{user['username']}" if user.get("username") else "(senza username)"
+            await send_telegram_message_once(
+                bot,
+                update_id,
+                f"access_request:{user_id}",
+                admin_id,
+                f"Nuova richiesta di accesso\n{display_name}\n{username}\nID: {user_id}",
+                reply_markup=access_user_keyboard(int(user_id), "pending"),
+            )
+            mark_admin_notified(int(user_id))
+        if is_start_command or created:
+            await send_telegram_message_once(
+                bot, update_id, "access_pending", chat_id,
+                "Richiesta inviata all'amministratore. Ti avviserò quando l'accesso sarà deciso.",
+            )
+        return False
+
+    if is_start_command:
+        status_message = (
+            "La tua richiesta di accesso è stata rifiutata."
+            if status == "rejected"
+            else "Il tuo accesso al bot è stato revocato."
+        )
+        await send_telegram_message_once(bot, update_id, f"access_{status}", chat_id, status_message)
+    return False
+
+
 def save_session(
     chat_id: int,
     status: str,
@@ -550,6 +879,11 @@ def cleanup_expired_sessions(timer: func.TimerRequest) -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(days=get_retention_days())
     for table_client in (get_table_client(), get_table_client("ProcessedUpdates")):
         for entity in table_client.list_entities():
+            if table_client.table_name == "ProcessedUpdates" and entity.get("PartitionKey") in {
+                ACCESS_PARTITION_KEY,
+                BOT_CONFIG_PARTITION_KEY,
+            }:
+                continue
             last_updated = entity.get("lastUpdated")
             if not last_updated:
                 continue
@@ -873,6 +1207,25 @@ async def process_telegram_update(update: dict, update_id: int, attempt: int) ->
             chat_id = callback_query["message"]["chat"]["id"]
             callback_data = callback_query.get("data")
             user_id = callback_query.get("from", {}).get("id")
+            if callback_data and callback_data.startswith(ADMIN_CALLBACK_PREFIX):
+                if not is_admin_user(user_id):
+                    await send_telegram_message_once(
+                        bot, update_id, "admin_only_callback", chat_id,
+                        "Questa opzione è riservata all'amministratore.",
+                    )
+                    return
+                await handle_admin_callback(bot, update_id, chat_id, callback_data)
+                return
+
+            if not await enforce_user_access(
+                bot,
+                update_id,
+                callback_query.get("from", {}),
+                chat_id,
+                is_start_command=False,
+            ):
+                return
+
             player_session = get_player_session(user_id, chat_id)
             if player_session:
                 update_session_with_retry(player_session["sessionCode"], lambda _: {})
@@ -909,6 +1262,28 @@ async def process_telegram_update(update: dict, update_id: int, attempt: int) ->
         chat_id = message["chat"]["id"]
         text = message.get("text", "").strip()
         user_id = message.get("from", {}).get("id")
+
+        is_admin_command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/admin" if text else False
+        if is_admin_command:
+            if is_admin_user(user_id):
+                await send_admin_menu(bot, update_id, chat_id)
+            else:
+                await send_telegram_message_once(
+                    bot, update_id, "admin_command_denied", chat_id,
+                    "Il comando /admin è riservato all'amministratore.",
+                )
+            return
+
+        is_start_command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/start" if text else False
+        if not await enforce_user_access(
+            bot,
+            update_id,
+            message.get("from", {}),
+            chat_id,
+            is_start_command=is_start_command,
+        ):
+            return
+
         interaction_session = get_player_session(user_id, chat_id)
         if interaction_session:
             update_session_with_retry(interaction_session["sessionCode"], lambda _: {})
