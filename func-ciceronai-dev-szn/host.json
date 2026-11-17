@@ -10,7 +10,8 @@
   },
   "extensions": {
     "queues": {
-      "maxDequeueCount": 3
+      "maxDequeueCount": 3,
+      "maxPollingInterval": "00:00:02"
     }
   },
   "extensionBundle": {
