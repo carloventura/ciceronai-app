@@ -10,6 +10,7 @@ from azure.core.credentials import AzureNamedKeyCredential
 from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableClient, TableServiceClient
 from telegram import Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 
 from fantasy_names import ADJECTIVES, NOUNS
 
@@ -19,6 +20,8 @@ NEW_CHARACTER_PROMPT = "Descrivi il tuo personaggio nel formato nome | descrizio
 SESSION_CODE_PROMPT = "Scrivi il nome della sessione da recuperare."
 JOIN_CHARACTER_PROMPT_PREFIX = "Descrivi il personaggio per la sessione "
 JOIN_CHARACTER_PROMPT_SUFFIX = " nel formato nome | descrizione."
+START_SESSION_CALLBACK_PREFIX = "start_session:"
+SESSION_OPENING_MESSAGE = "C'era una volta blablabla"
 
 
 def generate_session_name() -> str:
@@ -83,6 +86,19 @@ def get_session_by_name(session_name: str) -> dict | None:
         return None
 
 
+def get_session_characters(session: dict | None) -> list[dict]:
+    if not session:
+        return []
+
+    try:
+        characters = json.loads(session.get("characters", "[]"))
+    except (TypeError, json.JSONDecodeError):
+        logging.warning("Session %s has invalid characters data.", session.get("sessionCode"))
+        return []
+
+    return characters if isinstance(characters, list) else []
+
+
 def save_session(
     chat_id: int,
     status: str,
@@ -96,13 +112,7 @@ def save_session(
             session_name = generate_session_name()
 
     existing_session = get_session_by_name(session_name)
-    try:
-        characters = json.loads(existing_session.get("characters", "[]")) if existing_session else []
-    except (TypeError, json.JSONDecodeError):
-        logging.warning("Session %s has invalid characters data; resetting it.", session_name)
-        characters = []
-    if not isinstance(characters, list):
-        characters = []
+    characters = get_session_characters(existing_session)
     if character:
         characters.append(character)
 
@@ -110,7 +120,7 @@ def save_session(
     table_client.upsert_entity({
         "PartitionKey": session_name,
         "RowKey": "session",
-        "chatId": str(chat_id),
+        "chatId": existing_session.get("chatId", str(chat_id)) if existing_session else str(chat_id),
         "sessionCode": session_name,
         "displayName": session_name,
         "status": status,
@@ -166,6 +176,39 @@ async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
             await bot.answer_callback_query(callback_query["id"])
             chat_id = callback_query["message"]["chat"]["id"]
             callback_data = callback_query.get("data")
+            if callback_data and callback_data.startswith(START_SESSION_CALLBACK_PREFIX):
+                session_code = callback_data[len(START_SESSION_CALLBACK_PREFIX):]
+                session = get_session_by_name(session_code)
+                user_id = callback_query.get("from", {}).get("id")
+                characters = get_session_characters(session)
+
+                if not session:
+                    await bot.send_message(chat_id, "Non ho trovato questa sessione.")
+                elif not any(str(character.get("telegramUserId")) == str(user_id) for character in characters):
+                    await bot.send_message(chat_id, "Solo i giocatori registrati possono avviare la sessione.")
+                elif session.get("status") == "started":
+                    await bot.send_message(chat_id, "La sessione è già iniziata.")
+                else:
+                    save_session(
+                        int(session.get("chatId", chat_id)),
+                        "started",
+                        session_name=session_code,
+                    )
+                    recipient_chat_ids = {
+                        int(character["telegramChatId"])
+                        for character in characters
+                        if character.get("telegramChatId") is not None
+                    }
+                    for recipient_chat_id in recipient_chat_ids:
+                        try:
+                            await bot.send_message(recipient_chat_id, SESSION_OPENING_MESSAGE)
+                        except TelegramError:
+                            logging.exception(
+                                "Could not send session opening to chat %s.",
+                                recipient_chat_id,
+                            )
+
+                return func.HttpResponse("OK", status_code=200)
 
             if callback_data == "new_session":
                 await bot.send_message(
@@ -216,10 +259,19 @@ async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
                     )
                     return func.HttpResponse("OK", status_code=200)
 
+                character["telegramUserId"] = message.get("from", {}).get("id")
+                character["telegramChatId"] = chat_id
                 session_name = save_session(chat_id, "active", character=character)
+                start_keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "Avvia Sessione",
+                        callback_data=f"{START_SESSION_CALLBACK_PREFIX}{session_name}",
+                    )
+                ]])
                 await bot.send_message(
                     chat_id,
-                    f"Benvenuto! La tua sessione è pronta.\n\nNome della chat: {session_name}\nCodice sessione: {session_name}\n\nUsa questo nome per recuperarla.",
+                    f"Benvenuto! La tua sessione è pronta.\n\nNome della chat: {session_name}\nCodice sessione: {session_name}\n\nIl tuo personaggio è registrato. Puoi avviare la sessione ora oppure attendere altri giocatori.",
+                    reply_markup=start_keyboard,
                 )
                 return func.HttpResponse("OK", status_code=200)
 
@@ -230,6 +282,9 @@ async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
                         chat_id,
                         "Non ho trovato una sessione con questo nome. Inizia con /start per crearne una.",
                     )
+                    return func.HttpResponse("OK", status_code=200)
+                if session.get("status") == "started":
+                    await bot.send_message(chat_id, "Questa sessione è già iniziata e non accetta altri giocatori.")
                     return func.HttpResponse("OK", status_code=200)
 
                 await bot.send_message(
@@ -253,6 +308,8 @@ async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
                         chat_id,
                         "Non ho trovato una sessione con questo nome. Inizia con /start per crearne una.",
                     )
+                elif session.get("status") == "started":
+                    await bot.send_message(chat_id, "Questa sessione è già iniziata e non accetta altri giocatori.")
                 elif character is None:
                     await bot.send_message(
                         chat_id,
@@ -260,10 +317,19 @@ async def ChatMessage(req: func.HttpRequest) -> func.HttpResponse:
                         reply_markup=ForceReply(selective=True),
                     )
                 else:
+                    character["telegramUserId"] = message.get("from", {}).get("id")
+                    character["telegramChatId"] = chat_id
                     save_session(chat_id, "active", session_name=session_code, character=character)
+                    start_keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "Avvia Sessione",
+                            callback_data=f"{START_SESSION_CALLBACK_PREFIX}{session_code}",
+                        )
+                    ]])
                     await bot.send_message(
                         chat_id,
-                        f"Sessione recuperata: {session['displayName']}",
+                        f"Sessione recuperata: {session['displayName']}. Il tuo personaggio è registrato. Puoi avviare la sessione ora oppure attendere altri giocatori.",
+                        reply_markup=start_keyboard,
                     )
                 return func.HttpResponse("OK", status_code=200)
 
